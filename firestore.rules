@@ -1,0 +1,164 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
+    function reservationAfter(reservationId) {
+      return getAfter(/databases/$(database)/documents/reservations/$(reservationId));
+    }
+
+    match /users/{userId} {
+      allow create: if isOwner(userId)
+        && request.resource.data.uid == userId
+        && request.resource.data.tipoUsuario in ['Cliente', 'Negocio'];
+      allow read: if isOwner(userId);
+      allow update: if isOwner(userId)
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.tipoUsuario == resource.data.tipoUsuario
+        && request.resource.data.correo == resource.data.correo;
+
+      match /favorites/{foodId} {
+        allow read: if isOwner(userId);
+        allow create, update: if isOwner(userId)
+          && request.resource.data.uid == userId
+          && request.resource.data.foodId == foodId;
+        allow delete: if isOwner(userId);
+      }
+    }
+
+    match /businesses/{businessId} {
+      allow create: if signedIn()
+        && businessId == request.auth.uid
+        && request.resource.data.uidUsuario == request.auth.uid;
+      allow read: if signedIn();
+      allow update: if signedIn()
+        && resource.data.uidUsuario == request.auth.uid
+        && request.resource.data.uidUsuario == resource.data.uidUsuario;
+      allow delete: if false;
+    }
+
+    match /foods/{foodId} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.uidNegocio == request.auth.uid
+        && request.resource.data.status == 'Disponible'
+        && request.resource.data.published == true
+        && request.resource.data.quantity is int
+        && request.resource.data.quantity > 0;
+
+      allow update: if signedIn() && (
+        (resource.data.uidNegocio == request.auth.uid
+          && request.resource.data.uidNegocio == resource.data.uidNegocio)
+        || clientReserveUpdate(foodId)
+        || clientCancellationRestock(foodId)
+      );
+      allow delete: if false;
+
+      function clientReserveUpdate(foodId) {
+        let reservationId = request.resource.data.lastReservationId;
+        let changed = request.resource.data.diff(resource.data).affectedKeys();
+        return resource.data.quantity is int
+          && resource.data.published == true
+          && request.resource.data.published == true
+          && request.resource.data.quantity is int
+          && resource.data.status == 'Disponible'
+          && request.resource.data.quantity >= 0
+          && request.resource.data.quantity < resource.data.quantity
+          && request.resource.data.status in ['Disponible', 'Agotado']
+          && changed.hasOnly(['quantity', 'status', 'updatedAt', 'lastReservationId'])
+          && reservationAfter(reservationId).data.uidCliente == request.auth.uid
+          && reservationAfter(reservationId).data.foodId == foodId
+          && reservationAfter(reservationId).data.estadoReserva == 'Confirmada';
+      }
+
+      function clientCancellationRestock(foodId) {
+        let reservationId = request.resource.data.lastStockMutationReservationId;
+        let changed = request.resource.data.diff(resource.data).affectedKeys();
+        return resource.data.quantity is int
+          && request.resource.data.quantity is int
+          && request.resource.data.quantity > resource.data.quantity
+          && request.resource.data.status == 'Disponible'
+          && changed.hasOnly(['quantity', 'status', 'updatedAt', 'lastStockMutationReservationId'])
+          && reservationAfter(reservationId).data.uidCliente == request.auth.uid
+          && reservationAfter(reservationId).data.foodId == foodId
+          && reservationAfter(reservationId).data.estadoReserva == 'Cancelada';
+      }
+    }
+
+    match /reservations/{reservationId} {
+      allow create: if signedIn()
+        && request.resource.data.uidCliente == request.auth.uid
+        && request.resource.data.estadoReserva == 'Confirmada'
+        && request.resource.data.quantityReserved is int
+        && request.resource.data.quantityReserved > 0
+        && request.resource.data.unitPriceCents is int
+        && request.resource.data.totalCents is int;
+      allow read: if signedIn()
+        && (resource.data.uidCliente == request.auth.uid
+          || resource.data.uidNegocio == request.auth.uid);
+      allow update: if signedIn() && (
+        (resource.data.uidCliente == request.auth.uid
+          && resource.data.estadoReserva in ['Confirmada', 'Reservada']
+          && request.resource.data.estadoReserva == 'Cancelada'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['estadoReserva', 'cancelledAt']))
+        ||
+        (resource.data.uidNegocio == request.auth.uid
+          && resource.data.estadoReserva in ['Confirmada', 'Reservada']
+          && request.resource.data.estadoReserva == 'Completada'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['estadoReserva', 'completedAt']))
+      );
+      allow delete: if false;
+    }
+
+    match /reservationGuards/{guardId} {
+      // A reservation transaction must be able to read an absent guard before
+      // creating it. Guard documents contain only identifiers and active state.
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.uidCliente == request.auth.uid
+        && request.resource.data.active == true;
+      allow update: if signedIn()
+        && request.resource.data.uidCliente == resource.data.uidCliente
+        && request.resource.data.foodId == resource.data.foodId
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['active', 'reservationId', 'updatedAt'])
+        && (
+          (resource.data.uidCliente == request.auth.uid
+            && (
+              (resource.data.active == true
+                && request.resource.data.active == false
+                && request.resource.data.reservationId == resource.data.reservationId)
+              ||
+              (resource.data.active == false
+                && request.resource.data.active == true)
+            ))
+          ||
+          (getAfter(/databases/$(database)/documents/reservations/$(resource.data.reservationId)).data.uidNegocio == request.auth.uid
+            && getAfter(/databases/$(database)/documents/reservations/$(resource.data.reservationId)).data.estadoReserva == 'Completada'
+            && request.resource.data.active == false
+            && request.resource.data.reservationId == resource.data.reservationId)
+        );
+      allow delete: if false;
+    }
+
+    match /images/{imageId} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.entityType in ['food', 'business', 'user']
+        && request.resource.data.content is bytes
+        && request.resource.data.content.size() <= 102400
+        && request.resource.data.mime == 'image/jpeg';
+      allow update: if signedIn()
+        && resource.data.ownerUid == request.auth.uid
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && request.resource.data.entityType == resource.data.entityType
+        && request.resource.data.entityId == resource.data.entityId
+        && request.resource.data.content is bytes
+        && request.resource.data.content.size() <= 102400
+        && request.resource.data.mime == 'image/jpeg';
+      allow delete: if signedIn() && resource.data.ownerUid == request.auth.uid;
+    }
+  }
+}
